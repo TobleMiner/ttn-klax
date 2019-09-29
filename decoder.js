@@ -107,12 +107,12 @@ function mkRegister(data, lastValid, unitId) {
 
 function decodeHistoric(data) {
   var regmask = data[0];
-  var reg1Active = regmask & 0x01 > 0;
+  var reg1Active = (regmask & 0x01) > 0;
   var reg1Filter = (regmask & 0x06) >> 1;
-  var reg1Valid = regmask & 0x08 > 0;
-  var reg2Active = regmask & 0x10 > 0;
+  var reg1Valid = (regmask & 0x08) > 0;
+  var reg2Active = (regmask & 0x10) > 0;
   var reg2Filter = (regmask & 0x60) >> 5;
-  var reg2Valid = regmask & 0x80 > 0;
+  var reg2Valid = (regmask & 0x80) > 0;
   var units = data[1];
   var reg1Unit = units & 0x0f;
   var reg2Unit = (units & 0xf0) >> 4;
@@ -135,8 +135,8 @@ function decodeHistoric(data) {
 function decodeNow(data) {
   var registers = [ ];
   for(var i = 0; i < 4; i++) {
-    var filterSet = data[0] & (1<<i) > 0;
-    var filterValid = data[0] & (1<<(i + 4)) > 0;
+    var filterSet = (data[0] & (1<<i)) > 0;
+    var filterValid = (data[0] & (1<<(i + 4))) > 0;
     var unitReg = data[i >= 2 ? 2 : 1];
     var unitId = (unitReg & (i % 2 == 0 ? 0x0f : 0xf0)) << ((i % 2) * 4);
     var reg = mkRegister(data.slice(3 + (4 * i), 3 + (4 * (i + 1))), filterValid, unitId);
