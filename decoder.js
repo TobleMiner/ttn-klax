@@ -76,6 +76,19 @@ function decodeUint16BE(data) {
   return decodeUintN(data, 16, true);
 }
 
+function decodeIntN(data, bits, be) {
+  var val = 0;
+  var bytes = bits / 8;
+  for(var i = 0; i < bytes; i++) {
+    val += data[i] << ((be ? (bytes - 1 - i) : i) * 8);
+  }
+  return val;
+}
+
+function decodeInt32BE(data) {
+  return decodeIntN(data, 32, true);
+}
+
 function mkRegister(data, lastValid, unitId) {
   var unit = unitId < REGISTER_UNITS.length ? REGISTER_UNITS[unitId] : null;
   var dataValid = false;
@@ -93,7 +106,7 @@ function mkRegister(data, lastValid, unitId) {
       }
       values.push(bytes);
     } else {
-      var val = decodeUint32LE(data);
+      var val = decodeInt32BE(data);
       if(val != 0) {
         dataValid = true;
       }
