@@ -60,18 +60,6 @@ function decodeUintN(data, bits, be) {
   return val;
 }
 
-function decodeUint32LE(data) {
-  return decodeUintN(data, 32, false);
-}
-
-function decodeUint16LE(data) {
-  return decodeUintN(data, 16, false);
-}
-
-function decodeUint32BE(data) {
-  return decodeUintN(data, 32, true);
-}
-
 function decodeUint16BE(data) {
   return decodeUintN(data, 16, true);
 }
