@@ -2,11 +2,15 @@
 
 /*
   TTN decoder for KLAX LoRaWAN electricity meter sensors
-  © Tobias Schramm 2019 (tobias.schramm@t-sys.eu) (licensed under CC BY-NC-SA 4.0)
+  © Tobias Schramm 2020 (tobias.schramm@t-sys.eu) (licensed under CC BY-NC-SA 4.0)
 */
 
+// Dump raw regsiter contents without decoding
 var REGISTER_RAW = false;
+// Enable debug console.log
 var DEBUG = true;
+// Use legacy output format, enables old output format for more modern Klax
+var LEGACY_FORMAT = false;
 
 function debug(msg) {
   if(DEBUG) {
@@ -22,20 +26,47 @@ function error(msg) {
   console.log('[ERROR] ' + msg);
 }
 
+var SML_KLAX = "SML Klax";
+var MODBUS_KLAX = "MODBUS Klax";
+
+var KLAX_TYPES = [
+  SML_KLAX,
+  MODBUS_KLAX,
+];
+
 var METER_TYPES = [
   'SML',
   'IEC 62056-21 Mode B',
   'IEC 62056-21 Mode C',
   'Logarex',
+  'eBZ',
+  'Tritschler VC3',
+];
+
+var MODBUS_MODES = [
+  'MODBUS RTU',
+  'MODBUS ASCII',
+  'MODBUS RTU INTERDELAY',
 ];
 
 function parseHeader(data) {
-  var version = data[0];
-  var batteryPerc = (data[1] & 0xf) * 10;
-  var meterType = METER_TYPES[(data[1] & 0x30) >> 4];
+  var version = (data[0] & 0xfc) >> 2;
+  var deviceType = KLAX_TYPES[data[0] & 0x3];
+  if (version > 0) {
+    var batteryPerc = (data[1] & 0x7) * 20;
+    var readMode = (data[1] & 0x38) >> 3;
+  } else {
+    var batteryPerc = (data[1] & 0xf) * 10;
+    var readMode = (data[1] & 0x30) >> 4;
+  }
+  if (deviceType == SML_KLAX) {
+    var meterType = METER_TYPES[readMode];
+  } else {
+    var meterType = MODBUS_MODES[readMode];
+  }
   var configured = (data[1] & 0x40) > 0;
   var connTest = (data[1] & 0x80) > 0;
-  return { 'version': version, 'batteryPerc': batteryPerc, 'meterType': meterType, 'configured': configured, 'connTest': connTest };
+  return { 'version': version, 'deviceType': deviceType, 'batteryPerc': batteryPerc, 'meterType': meterType, 'configured': configured, 'connTest': connTest };
 }
 
 var REGISTER_UNITS = [
@@ -44,10 +75,14 @@ var REGISTER_UNITS = [
   'W',
   'V',
   'A',
-  'Hz'
+  'Hz',
+  'varh',
+  'var',
+  'VAh',
+  'VA',
 ];
 
-function exp2(power) {
+function pow2(power) {
   return Math.pow(2, power);
 }
 
@@ -55,13 +90,17 @@ function decodeUintN(data, bits, be) {
   var val = 0;
   var bytes = bits / 8;
   for(var i = 0; i < bytes; i++) {
-    val += data[be ? bytes - 1 - i : i] * exp2(i * 8);
+    val += data[be ? bytes - 1 - i : i] * pow2(i * 8);
   }
   return val;
 }
 
 function decodeUint16BE(data) {
   return decodeUintN(data, 16, true);
+}
+
+function decodeUint32BE(data) {
+  return decodeUintN(data, 32, true);
 }
 
 function decodeIntN(data, bits, be) {
@@ -73,11 +112,71 @@ function decodeIntN(data, bits, be) {
   return val;
 }
 
+function decodeInt16BE(data) {
+  return decodeIntN(data, 16, true);
+}
+
 function decodeInt32BE(data) {
   return decodeIntN(data, 32, true);
 }
 
-function mkRegister(data, lastValid, unitId) {
+IEE754_FLOAT_MANTISSA_BITS = 23
+IEE754_FLOAT_EXPONENT_BITS = 8
+
+function decodeIEE754FloatBE(data) {
+  var mantissa = data[3] | (data[2] << 8) | ((data[1] & 0x7f) << 16);
+  var exponent = ((data[1] & 0x80) >> 7) | ((data[0] & 0x7f) << 1);
+  var sign = Math.pow(-1, (data[0] & 0x80) >> 7);
+  var exception = exponent == pow2(IEE754_FLOAT_EXPONENT_BITS) - 1;
+  if (exception) {
+    if (mantissa > 0) {
+      return NaN;
+    } else {
+      return sign * Infinity;
+    }
+  }
+
+  var normalized = exponent > 0;
+  if (normalized) {
+    // Remove exponent bias
+    exponent -= pow2(IEE754_FLOAT_EXPONENT_BITS - 1) - 1;
+    return sign * (pow2(exponent) + mantissa * pow2(exponent - IEE754_FLOAT_MANTISSA_BITS));
+  } else {
+    exponent = -(pow2(IEE754_FLOAT_EXPONENT_BITS - 1) - 2);
+    return sign * (mantissa * pow2(exponent - IEE754_FLOAT_MANTISSA_BITS));
+  }
+}
+
+IEE754_DOUBLE_MANTISSA_BITS = 52
+IEE754_DOUBLE_EXPONENT_BITS = 11
+
+function decodeIEE754DoubleBE(data) {
+  var mantissa = data[7] | (data[6] << 8) | (data[5] << 16) | (data[4] << 24);
+  // Bitops are 32 bit in js, use arithmetics for more than 32 bits
+  mantissa += (data[3] | (data[2] << 8) | ((data[1] & 0xf) << 16)) * pow2(32);
+  var exponent = ((data[1] & 0xf0) >> 4) | ((data[0] & 0x7f) << 4);
+  var sign = Math.pow(-1, (data[0] & 0x80) >> 7);
+  var exception = exponent == pow2(IEE754_DOUBLE_EXPONENT_BITS) - 1;
+  if (exception) {
+    if (mantissa > 0) {
+      return NaN;
+    } else {
+      return sign * Infinity;
+    }
+  }
+
+  var normalized = exponent > 0;
+  if (normalized) {
+    // Remove exponent bias
+    exponent -= pow2(IEE754_DOUBLE_EXPONENT_BITS - 1) - 1;
+    return sign * (pow2(exponent) + mantissa * pow2(exponent - IEE754_DOUBLE_MANTISSA_BITS));
+  } else {
+    exponent = -(pow2(IEE754_DOUBLE_EXPONENT_BITS - 1) - 2);
+    return sign * (mantissa * pow2(exponent - IEE754_DOUBLE_MANTISSA_BITS));
+  }
+}
+
+function mkRegister(data, lastValid, unitId, valueDecoder) {
   var unit = unitId < REGISTER_UNITS.length ? REGISTER_UNITS[unitId] : null;
   var dataValid = false;
   var values = [ ];
@@ -94,7 +193,7 @@ function mkRegister(data, lastValid, unitId) {
       }
       values.push(bytes);
     } else {
-      var val = decodeInt32BE(data);
+      var val = valueDecoder(data);
       if(val != 0) {
         dataValid = true;
       }
@@ -103,7 +202,7 @@ function mkRegister(data, lastValid, unitId) {
     data = data.slice(4);
   }
   dataValid = dataValid || lastValid;
-  return { 'data_valid': dataValid, 'unit': unit, 'values': values };
+  return { 'data_valid': dataValid, 'dataValid': dataValid, 'unit': unit, 'values': values };
 }
 
 function decodeHistoric(data) {
@@ -120,32 +219,62 @@ function decodeHistoric(data) {
   data = data.slice(2);
   var registers = [ ];
   if(reg1Active) {
-    var reg = mkRegister(data.slice(0, 16), reg1Valid, reg1Unit);
+    var reg = mkRegister(data.slice(0, 16), reg1Valid, reg1Unit, decodeInt32BE);
     reg.filterId = reg1Filter;
     registers.push(reg);
   }
   data = data.slice(16);
   if(reg2Active) {
-    var reg = mkRegister(data.slice(0, 16), reg2Valid, reg2Unit);
+    var reg = mkRegister(data.slice(0, 16), reg2Valid, reg2Unit, decodeInt32BE);
     reg.filterId = reg2Filter;
     registers.push(reg);
   }
   return { 'type': 'historic', 'registers': registers };
 }
 
-function decodeNow(data) {
+function decodeFilter(data) {
+  var filterActive = (data[0] & 0x1) > 0;
+  var filterId = (data[0] & 0x6) >> 1;
+  var unitId = (data[0] & 0xf0) >> 4;
+  var dataValid = (data[1] & 0xf);
+  data = data.slice(2);
+  var values = [ ];
+  if (LEGACY_FORMAT) {
+    var registers = [ mkRegister(data, dataValid > 0, unitId, decodeIEE754FloatBE) ];
+    return { 'type': 'historic', 'registers': registers };
+  } else {
+    var filterUnit = REGISTER_UNITS[unitId];
+    for (var i = 0; i < 4; i++) {
+      var value = decodeIEE754FloatBE(data);
+      var valid = (dataValid & (1 << i)) > 0;
+      values.push({ 'value': value, 'valid': valid });
+      data = data.slice(4);
+    }
+    return { 'type': 'filter', 'register': { 'filterActive': filterActive, 'filterId': filterId, 'unit': filterUnit, 'values': values } };
+  }
+}
+
+function decodeNow(data, valueDecoder) {
   var registers = [ ];
   for(var i = 0; i < 4; i++) {
     var filterSet = (data[0] & (1<<i)) > 0;
     var filterValid = (data[0] & (1<<(i + 4))) > 0;
     var unitReg = data[i >= 2 ? 2 : 1];
-    var unitId = (unitReg & (i % 2 == 0 ? 0x0f : 0xf0)) << ((i % 2) * 4);
-    var reg = mkRegister(data.slice(3 + (4 * i), 3 + (4 * (i + 1))), filterValid, unitId);
+    var unitId = (unitReg & (i % 2 == 0 ? 0x0f : 0xf0)) >> ((i % 2) * 4);
+    var reg = mkRegister(data.slice(3 + (4 * i), 3 + (4 * (i + 1))), filterValid, unitId, valueDecoder);
     reg.filterSet = filterSet;
     reg.filterValid = filterValid;
     registers.push(reg);
   }
   return { 'type': 'now', 'registers': registers };
+}
+
+function decodeNowInt32(data) {
+  return decodeNow(data, decodeInt32BE);
+}
+
+function decodeNowFloat(data) {
+  return decodeNow(data, decodeIEE754FloatBE);
 }
 
 function uint8ToHex(val) {
@@ -164,17 +293,76 @@ function decodeServerID(data) {
   return { 'type': 'serverID', 'id': id };
 }
 
-var PAYLOAD_HANDLERS = [
-  { 'id': 1, 'len': 34, 'decode': decodeHistoric },
-  { 'id': 2, 'len': 19, 'decode': decodeNow },
-  { 'id': 3, 'len': 10, 'decode': decodeServerID },
+var MODBUS_FILTER_TYPES = [
+  { 'name': "DOUBLE", 'decode': decodeIEE754DoubleBE },
+  { 'name': "INT16", 'decode': decodeInt16BE },
+  { 'name': "UINT16", 'decode': decodeUint16BE },
+  { 'name': "INT32", 'decode': decodeInt32BE },
+  { 'name': "UINT32", 'decode': decodeUint32BE },
+  { 'name': "FLOAT", 'decode': decodeIEE754FloatBE },
 ];
 
-function getHandler(data) {
+function decodeModbusFilter(data, len) {
+  var filterActive = (data[0] & 0x1) > 0;
+  var filterId = (data[0] & 0x6) >> 1;
+  var filterType = MODBUS_FILTER_TYPES[(data[0] & 0xf0) >> 4];
+  var registerValid = (data[1] & 0xf);
+  data = data.slice(2);
+  values = [ ];
+  var i = 0;
+  while (data.length >= len) {
+    values.push({ 'valid': (registerValid & (1 << i)) > 0, 'value': filterType.decode(data) });
+    data = data.slice(len);
+    i++;
+  }
+
+  return { 'type': 'registerFilter', 'register': { 'filterId': filterId, 'filterActive': filterActive, 'filterType': filterType.name, 'values': values } };
+}
+
+function decodeModbusFilter2Byte(data) {
+  return decodeModbusFilter(data, 2);
+}
+
+function decodeModbusFilter4Byte(data) {
+  return decodeModbusFilter(data, 4);
+}
+
+function decodeModbusFilter8Byte(data) {
+  return decodeModbusFilter(data, 8);
+}
+
+function decodeDeviceID(data) {
+  var id = decodeUint32BE(data);
+  return { 'type': 'deviceID', 'id': id };
+}
+
+function decodeModbusRegisterStatus(data) {
+  var status = data[0];
+  var filters = [];
+  for (var i = 0; i < 4; i++) {
+    filters.push({ 'set': (status & (1 << i)) > 0, 'valid': (status & (1 << (4 + i))) > 0 });
+  }
+  return { 'type': 'modbusRegisterStatus', 'filters': filters };
+}
+
+var PAYLOAD_HANDLERS = [
+  { 'id': 1, 'len': 34, 'decode': decodeHistoric, 'version': 0 },
+  { 'id': 1, 'len': 18, 'decode': decodeFilter },
+  { 'id': 2, 'len': 19, 'decode': decodeNowInt32, 'version': 0 },
+  { 'id': 2, 'len': 19, 'decode': decodeNowFloat },
+  { 'id': 3, 'len': 10, 'decode': decodeServerID },
+  { 'id': 4, 'len': 10, 'decode': decodeModbusFilter2Byte },
+  { 'id': 5, 'len': 18, 'decode': decodeModbusFilter4Byte },
+  { 'id': 6, 'len': 34, 'decode': decodeModbusFilter8Byte },
+  { 'id': 7, 'len': 1, 'decode': decodeModbusRegisterStatus },
+  { 'id': 8, 'len': 4, 'decode': decodeDeviceID },
+];
+
+function getHandler(data, version) {
   var id = data[0];
   for(var i = 0; i < PAYLOAD_HANDLERS.length; i++) {
     var handler = PAYLOAD_HANDLERS[i];
-    if(handler.id == id) {
+    if(handler.id == id && (handler['version'] == undefined || handler.version == version)) {
       return handler;
     }
   }
@@ -200,7 +388,7 @@ function parseApp(data) {
   debug('Got ' + data.length + ' bytes of payload');
   var payloads = [ ];
   while(data.length > 0) {
-    var handler = getHandler(data);
+    var handler = getHandler(data, header.version);
     if(!handler) {
       debug('Encountered unknown payload type ' + data[0])
       break;
@@ -241,6 +429,25 @@ function parseRegisterDefs(data) {
   return registers;
 }
 
+var MODBUS_READ_FUNCTION_CODES = [
+  'Read Coils',
+  'Read Discrete Inputs',
+  'Read Holding Registers',
+  'Read Input Registers',
+];
+
+function parseRegisterDefsModbus(data) {
+  var registers = [ ];
+  while(data.length >= 3) {
+    var registerAddress = decodeUint16BE(data)
+    var functionCode = MODBUS_READ_FUNCTION_CODES[data[2] & 0x3];
+    var filterType = MODBUS_FILTER_TYPES[(data[2] & 0xf0) >> 4];
+    registers.push({ 'registerAddress': registerAddress, 'functionCode': functionCode, 'variableType': filterType.name });
+    data = data.slice(3);
+  }
+  return registers;
+}
+
 function parseRegisterSearch(data) {
   var header = parseHeader(data);
   data = data.slice(2);
@@ -261,12 +468,56 @@ function parseRegisterSet(data) {
   return { 'type': 'registerSet', 'header': header, 'filters': filters };
 }
 
+var MODBUS_PARITIES = [
+  'NONE',
+  'ODD',
+  'EVEN',
+  'NONE SPECIAL',
+];
+
+function parseModbusSet(data) {
+  var header = parseHeader(data);
+  if (header.deviceType != MODBUS_KLAX) {
+    error("Invalid payload, modbusSet can only be used with MODBUS Klax");
+    return null;
+  }
+  data = data.slice(2);
+  var modbusAddr = data[0];
+  data = data.slice(1);
+  var modbusBaud = decodeUint16BE(data);
+  data = data.slice(2);
+  var modbusMode = MODBUS_MODES[data[0] & 0x3];
+  var modbusParity = MODBUS_PARITIES[(data[0] & 0x30) >> 4];
+  data = data.slice(1);
+  var modbusReadRetries = data[0] & 0xf;
+  var modbusReadTimeoutMilliseconds = ((data[0] & 0xf0) >> 4) * 100;
+  data = data.slice(1);
+  var modbusWriteBeforeRead = (data[0] & 0x1) > 0;
+  var modbusWaitBeforeReadMilliseconds = ((data[0] & 0xf0) >> 4) * 100;
+  data = data.slice(1);
+  var modbusWriteAddr = decodeUint16BE(data);
+  data = data.slice(2);
+  var modbusWriteData = decodeUint16BE(data);
+  data = data.slice(2);
+  var activeFilters = data[0] & 0x0f;
+  data = data.slice(1);
+  var filters = parseRegisterDefsModbus(data.slice(0, 12));
+  for(var i = 0; i < filters.length; i++) {
+    filters[i].active = ((activeFilters & (1<<i)) >> i) > 0;
+  }
+  return { 'type': 'modbusSet', 'header': header, 'modbus': { 'address': modbusAddr, 'baud': modbusBaud, 'mode': modbusMode,
+           'parity': modbusParity, 'readRetries': modbusReadRetries, 'readTimeoutMilliseconds': modbusReadTimeoutMilliseconds,
+           'writeBeforeRead': modbusWriteBeforeRead, 'waitBeforeReadMilliseconds': modbusWaitBeforeReadMilliseconds,
+           'writeAddress': modbusWriteAddr, 'writeData': modbusWriteData }, 'filters': filters };
+}
+
 var DECODERS = [
   { 'port': 3,   minLen:  4, name: 'app',            'decode': parseApp },
   { 'port': 100, minLen:  4, name: 'config',         'decode': parseConfig },
   { 'port': 101, minLen:  4, name: 'info',           'decode': parseInfo },
   { 'port': 103, minLen:  4, name: 'registerSearch', 'decode': parseRegisterSearch },
   { 'port': 104, minLen: 15, name: 'registerSet',    'decode': parseRegisterSet },
+  { 'port': 105, minLen: 25, name: 'modbusSet',      'decode': parseModbusSet },
 ];
 
 function getDecoder(port) {
@@ -291,4 +542,3 @@ function Decoder(bytes, port) {
   }
   return decoder.decode(bytes);
 }
-
