@@ -52,17 +52,19 @@ var MODBUS_MODES = [
 function parseHeader(data) {
   var version = (data[0] & 0xfc) >> 2;
   var deviceType = KLAX_TYPES[data[0] & 0x3];
-  if (version > 0) {
-    var batteryPerc = (data[1] & 0x7) * 20;
-    var readMode = (data[1] & 0x38) >> 3;
-  } else {
-    var batteryPerc = (data[1] & 0xf) * 10;
-    var readMode = (data[1] & 0x30) >> 4;
-  }
   if (deviceType == SML_KLAX) {
+    if (version > 0) {
+      var batteryPerc = (data[1] & 0x7) * 20;
+      var readMode = (data[1] & 0x38) >> 3;
+    } else {
+      var batteryPerc = (data[1] & 0xf) * 10;
+      var readMode = (data[1] & 0x30) >> 4;
+    }
     var meterType = METER_TYPES[readMode];
   } else {
-    var meterType = MODBUS_MODES[readMode];
+    var batteryPerc = (data[1] & 0xf) * 10;
+    var modbusMode = (data[1] & 0x30) >> 4;
+    var meterType = MODBUS_MODES[modbusMode];
   }
   var configured = (data[1] & 0x40) > 0;
   var connTest = (data[1] & 0x80) > 0;
