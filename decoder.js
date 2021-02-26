@@ -111,6 +111,9 @@ function decodeIntN(data, bits, be) {
   for(var i = 0; i < bytes; i++) {
     val += data[i] << ((be ? (bytes - 1 - i) : i) * 8);
   }
+  if (val >= (1 << (bits - 1))) {
+    val -= 1 << bits;
+  }
   return val;
 }
 
